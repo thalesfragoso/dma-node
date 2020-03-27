@@ -1,15 +1,19 @@
 #![no_std]
 
-use core::{mem::MaybeUninit, ptr, slice};
+use as_slice::{AsMutSlice, AsSlice};
+use core::{
+    fmt,
+    mem::MaybeUninit,
+    ops::{Deref, DerefMut},
+    ptr, slice,
+};
 use generic_array::{typenum::marker_traits::Unsigned, ArrayLength, GenericArray};
 
 pub mod typenum {
     pub use generic_array::typenum::consts;
 }
 
-pub trait DMANode {
-    type Target;
-
+pub trait DMANode<T>: Deref<Target = [T]> + DerefMut {
     /// Creates a new node
     fn new() -> Self;
 
@@ -18,7 +22,7 @@ pub trait DMANode {
     ///
     /// Note that this function internally first zeros the non-initialized elements of the node's
     /// buffer.
-    fn write(&mut self) -> &mut [Self::Target];
+    fn write(&mut self) -> &mut [T];
 
     /// Used to shrink the current size of the slice in the node, mostly used in conjunction
     /// with `write`.
@@ -27,13 +31,10 @@ pub trait DMANode {
     /// Used to write data into the node, and returns how many bytes were written from `buf`.
     ///
     /// If the node is already partially filled, this will continue filling the node.
-    fn write_slice(&mut self, buf: &[Self::Target]) -> usize;
+    fn write_slice(&mut self, buf: &[T]) -> usize;
 
     /// Clear the node of all data making it empty.
     fn clear(&mut self);
-
-    /// Returns a readable slice which maps to the buffers internal data.
-    fn read(&self) -> &[Self::Target];
 
     /// Reads how many bytes are available.
     fn len(&self) -> usize;
@@ -50,10 +51,16 @@ pub trait DMANode {
     unsafe fn set_len(&mut self, len: usize);
 
     /// Returns the address of the buffer.
-    fn buffer_address_for_dma(&self) -> u32;
+    fn buffer_address_for_dma(&self) -> usize;
 
     /// Returns the maximum length of the internal buffer.
-    fn max_len() -> usize;
+    fn max_len(&self) -> usize;
+
+    /// Returns the number of free elements in the internal buffer
+    #[inline]
+    fn free(&self) -> usize {
+        self.max_len() - self.len()
+    }
 }
 
 pub struct Node<N, W>
@@ -64,13 +71,11 @@ where
     buf: GenericArray<MaybeUninit<W>, N>,
 }
 
-// Heavily inspired by @korken89 work
-impl<N, W> DMANode for Node<N, W>
+// Heavily inspired by korken89 work
+impl<N, W> DMANode<W> for Node<N, W>
 where
     N: ArrayLength<MaybeUninit<W>> + Unsigned + 'static,
 {
-    type Target = W;
-    /// Creates a new node
     fn new() -> Self {
         Self {
             len: 0,
@@ -101,9 +106,7 @@ where
     }
 
     fn write_slice(&mut self, buf: &[W]) -> usize {
-        let free = N::USIZE - self.len;
-        let new_size = buf.len();
-        let count = if new_size > free { free } else { new_size };
+        let count = buf.len().min(self.free());
 
         // Used to write data into the `MaybeUninit`, safe based on the size check above
         unsafe {
@@ -118,34 +121,33 @@ where
         count
     }
 
+    #[inline]
     fn clear(&mut self) {
         self.len = 0;
     }
 
-    fn read(&self) -> &[W] {
-        // Safe as it uses the internal length of valid data
-        unsafe {
-            slice::from_raw_parts(self.buf.as_slice().as_ptr() as *const _, self.len as usize)
-        }
-    }
-
+    #[inline]
     fn len(&self) -> usize {
         self.len as usize
     }
 
+    #[inline]
     fn is_empty(&self) -> bool {
         self.len == 0
     }
 
+    #[inline]
     unsafe fn set_len(&mut self, len: usize) {
         self.len = len;
     }
 
-    fn buffer_address_for_dma(&self) -> u32 {
-        self.buf.as_slice().as_ptr() as u32
+    #[inline]
+    fn buffer_address_for_dma(&self) -> usize {
+        self.buf.as_slice().as_ptr() as usize
     }
 
-    fn max_len() -> usize {
+    #[inline]
+    fn max_len(&self) -> usize {
         N::USIZE
     }
 }
@@ -175,12 +177,87 @@ where
     }
 }
 
+impl<N, W> Deref for Node<N, W>
+where
+    N: ArrayLength<MaybeUninit<W>> + Unsigned + 'static,
+{
+    type Target = [W];
+
+    fn deref(&self) -> &Self::Target {
+        // Safe as it uses the internal length of valid data
+        unsafe {
+            slice::from_raw_parts(self.buf.as_slice().as_ptr() as *const _, self.len as usize)
+        }
+    }
+}
+
+impl<N, W> DerefMut for Node<N, W>
+where
+    N: ArrayLength<MaybeUninit<W>> + Unsigned + 'static,
+{
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        // Safe as it uses the internal length of valid data
+        unsafe {
+            slice::from_raw_parts_mut(
+                self.buf.as_mut_slice().as_ptr() as *mut _,
+                self.len as usize,
+            )
+        }
+    }
+}
+
+impl<N> fmt::Write for Node<N, u8>
+where
+    N: ArrayLength<MaybeUninit<u8>> + Unsigned + 'static,
+{
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        let free = self.free();
+
+        if s.len() > free {
+            Err(fmt::Error)
+        } else {
+            self.write_slice(s.as_bytes());
+            Ok(())
+        }
+    }
+}
+
+impl<N, W> fmt::Debug for Node<N, W>
+where
+    N: ArrayLength<MaybeUninit<W>> + Unsigned + 'static,
+    W: fmt::Debug,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:?}", &self[..])
+    }
+}
+
+impl<N, W> AsSlice for Node<N, W>
+where
+    N: ArrayLength<MaybeUninit<W>> + Unsigned + 'static,
+{
+    type Element = W;
+
+    fn as_slice(&self) -> &[Self::Element] {
+        &self[..]
+    }
+}
+
+impl<N, W> AsMutSlice for Node<N, W>
+where
+    N: ArrayLength<MaybeUninit<W>> + Unsigned + 'static,
+{
+    fn as_mut_slice(&mut self) -> &mut [Self::Element] {
+        &mut self[..]
+    }
+}
+
 #[cfg(test)]
 mod tests {
 
     use crate::typenum::consts::U8;
     use crate::{DMANode, Node};
-    use core::ptr;
+    use core::{fmt::Write, ptr};
 
     const DATA: &[u8] = &[1, 2, 3, 4, 5, 6, 7, 8];
 
@@ -190,20 +267,31 @@ mod tests {
         let written = node.write_slice(DATA);
         assert_eq!(written, DATA.len());
         assert_eq!(node.len(), DATA.len());
-        assert_eq!(node.read(), DATA);
-        assert_eq!(Node::<U8, u8>::max_len(), 8);
+        assert_eq!(&node[..], DATA);
+        assert_eq!(node.max_len(), 8);
     }
 
     #[test]
     fn write_with() {
         let mut node = Node::<U8, u8>::new();
-        let max_len = core::cmp::min(Node::<U8, u8>::max_len(), DATA.len());
+        let max_len = core::cmp::min(node.max_len(), DATA.len());
         unsafe {
             node.write_with(|buf, _len| {
                 ptr::copy_nonoverlapping(DATA.as_ptr(), buf.as_mut_ptr() as *mut u8, max_len);
                 max_len
             });
         }
-        assert_eq!(node.read(), DATA);
+        assert_eq!(&node[..], DATA);
+    }
+
+    #[test]
+    fn fmt_write() {
+        let text = "olá";
+        let text2 = "oi";
+        let mut node = Node::<U8, u8>::new();
+        write!(node, "{}", text).unwrap();
+        write!(node, "{}", text2).unwrap();
+        assert_eq!(&node[..], [text, text2].concat().as_bytes());
+        assert!(write!(node, "{}", text).is_err());
     }
 }
