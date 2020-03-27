@@ -2,9 +2,10 @@
 
 use as_slice::{AsMutSlice, AsSlice};
 use core::{
+    default::Default,
     fmt,
     mem::MaybeUninit,
-    ops::{Deref, DerefMut},
+    ops::{Deref, DerefMut, Drop},
     ptr, slice,
 };
 use generic_array::{typenum::marker_traits::Unsigned, ArrayLength, GenericArray};
@@ -20,8 +21,8 @@ pub trait DMANode<T>: Deref<Target = [T]> + DerefMut {
     /// Gives a `&mut [W]` slice to write into with the maximum size, the `commit` method
     /// must then be used to set the actual number of bytes written.
     ///
-    /// Note that this function internally first zeros the non-initialized elements of the node's
-    /// buffer.
+    /// Note that this function internally first initializes to default the non-initialized elements
+    /// of the node's buffer.
     fn write(&mut self) -> &mut [T];
 
     /// Used to shrink the current size of the slice in the node, mostly used in conjunction
@@ -75,6 +76,7 @@ where
 impl<N, W> DMANode<W> for Node<N, W>
 where
     N: ArrayLength<MaybeUninit<W>> + Unsigned + 'static,
+    W: Default,
 {
     fn new() -> Self {
         Self {
@@ -89,7 +91,9 @@ where
     fn write(&mut self) -> &mut [W] {
         // Initialize memory with a safe value
         for elem in self.buf.iter_mut().skip(self.len) {
-            *elem = MaybeUninit::zeroed();
+            unsafe {
+                ptr::write(elem.as_mut_ptr() as *mut W, W::default());
+            }
         }
         self.len = N::USIZE; // Set to max so `commit` may shrink it if needed
 
@@ -206,6 +210,19 @@ where
     }
 }
 
+impl<N, W> Drop for Node<N, W>
+where
+    N: ArrayLength<MaybeUninit<W>> + Unsigned + 'static,
+{
+    fn drop(&mut self) {
+        for elem in self.iter_mut() {
+            unsafe {
+                ptr::drop_in_place(elem);
+            }
+        }
+    }
+}
+
 impl<N> fmt::Write for Node<N, u8>
 where
     N: ArrayLength<MaybeUninit<u8>> + Unsigned + 'static,
@@ -255,7 +272,7 @@ where
 #[cfg(test)]
 mod tests {
 
-    use crate::typenum::consts::U8;
+    use crate::typenum::consts::*;
     use crate::{DMANode, Node};
     use core::{fmt::Write, ptr};
 
@@ -269,6 +286,17 @@ mod tests {
         assert_eq!(node.len(), DATA.len());
         assert_eq!(&node[..], DATA);
         assert_eq!(node.max_len(), 8);
+    }
+
+    #[test]
+    fn write_commit() {
+        let mut node = Node::<U9, u8>::new();
+        let inner = node.write();
+        for (elem, data) in inner.iter_mut().zip(DATA.iter()) {
+            *elem = *data;
+        }
+        node.commit(DATA.len());
+        assert_eq!(&node[..], DATA);
     }
 
     #[test]
